@@ -12,11 +12,9 @@ A video prediction model:
 
 import torch
 import torch.nn.functional as F
-import numpy as np
 
 from world_model_lens import HookedWorldModel
-#from world_model_lens.core.config import WorldModelConfig
-from world_model_lens.backends.generic_adapter import WorldModelConfig
+from world_model_lens.backends.base_adapter import AdapterConfig
 from world_model_lens.backends.video_adapter import VideoWorldModelAdapter
 from world_model_lens.envs import GymnasiumAdapter
 from world_model_lens.visualization import plot_video_model_dashboard
@@ -36,7 +34,7 @@ def main():
     d_obs = 3 * 64 * 64
     d_state = 256
 
-    config = WorldModelConfig(
+    config = AdapterConfig(
         d_state=d_state,
         d_obs=d_obs,
         is_discrete=False,
@@ -56,20 +54,22 @@ def main():
     print("\n[3] Wrapped in HookedWorldModel")
 
     T = 10
-    # Render real CartPole frames — render_mode="rgb_array" returns (H, W, 3) uint8 numpy
-    # arrays that we convert to (3, 64, 64) float tensors via channel-first transpose and resize.
-    env = GymnasiumAdapter("CartPole-v1", render_mode="rgb_array")
-    env.reset(seed=42)
+    # Build simple image tensors from real CartPole states without requiring pygame rendering.
+    env = GymnasiumAdapter("CartPole-v1")
+    obs, _ = env.reset(seed=42)
     frame_list = []
     for _ in range(T):
-        raw = env.render()
-        frame_t = torch.from_numpy(raw).permute(2, 0, 1).float() / 255.0
-        frame_t = F.interpolate(frame_t.unsqueeze(0), size=(64, 64), mode="bilinear", align_corners=False).squeeze(0)
+        state = torch.from_numpy(obs).float()
+        base = state.view(4, 1, 1).repeat(1, 16, 16).unsqueeze(0)
+        frame_t = F.interpolate(base, size=(64, 64), mode="nearest").squeeze(0)[:3]
         frame_list.append(frame_t)
-        env.step(env.action_space.sample())
+        result = env.step(env.action_space.sample())
+        obs = result.observation
+        if result.done:
+            break
     env.close()
     frames = torch.stack(frame_list)
-    print(f"\n[4] Collected {T} rendered frames from CartPole-v1: {frames.shape}")
+    print(f"\n[4] Collected {len(frame_list)} state-derived frames from CartPole-v1: {frames.shape}")
 
     traj, cache = wm.run_with_cache(frames)
     print(f"\n[5] Forward pass complete!")
@@ -81,14 +81,14 @@ def main():
     n_pred = 5
     preds, states = video_model.predict_next_frame(current_frame, n_frames=n_pred)
     print(f"    Predicted frames shape: {preds.shape}")
-    print(f"    Latent states: {len(states)} states, first state shape: {states[0].shape if states else 'N/A'}")
+    print(f"    Latent states: {len(states)} states, first state shape: {states[0].shape}")
 
     print("\n[7] Running imagination (latent rollout)...")
-    start_state = traj.states[0].state
-    imagined_states, rewards = wm.adapter.imagine(
-        start_state=start_state.unsqueeze(0),
-        horizon=10,
-    )
+    state = traj.states[0].state.unsqueeze(0)
+    imagined_states = []
+    for _ in range(10):
+        state = wm.adapter.transition(state, state)
+        imagined_states.append(state)
     print(f"    Imagined {len(imagined_states)} future states")
 
     print("\n[8] Plotting video model dashboard...")
